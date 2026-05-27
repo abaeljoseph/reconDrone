@@ -1,0 +1,18 @@
+# PyTorch weights — re-downloadable from ultralytics
+*.pt
+
+# Generated logs and recordings
+detections.csv
+*.avi
+Recon Drone Progress Photos/recording.avi
+
+# Runtime captures
+captures/
+
+# Claude Code internal settings
+.claude/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
