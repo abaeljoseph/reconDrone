@@ -9,10 +9,11 @@ Recon Drone Progress Photos/recording.avi
 # Runtime captures
 captures/
 
-# Claude Code internal settings
+# Local tool settings
 .claude/
 
 # Python cache
 __pycache__/
 *.pyc
 *.pyo
+build/
