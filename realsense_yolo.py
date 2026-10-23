@@ -13,14 +13,20 @@ Controls (terminal):
   oy <N>   — shift thermal overlay Y by N pixels
   q        — quit
 
+Geometry           : 848x480 native 16:9 throughout — preserves the D435's full
+                     89.9° HFOV (a 4:3 mode would crop 10° off the width) and
+                     feeds the 320x192 model with no letterbox waste.
 IR detection mode  : IR + depth @ 60 FPS, no colour stream
-RGB detection mode : colour + IR + depth @ 30 FPS
+RGB detection mode : colour + IR + depth @ 60 FPS
 Display            : main feed + thermal overlay (left) | thermal panel (right)
                      RED crosshair  = global thermal hotspot
                      YELLOW crosshair = hotspot within detected person region
 """
 
 import csv
+import math
+import os
+import socket
 import threading
 import time
 from datetime import datetime
@@ -29,10 +35,51 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pyrealsense2 as rs
-from ultralytics import YOLO
+from flask import Flask, Response
+
+# Not ultralytics: it imports torch unconditionally, which takes ~55s cold off
+# the SD card even though NCNN does all the inference. See ncnn_pose.py.
+from ncnn_pose import PoseNet
 
 # ── Config ────────────────────────────────────────────────────────────────────
-INFERENCE_SIZE = 320
+# Geometry is 16:9 end to end. The D435 CROPS to make 4:3 — 848x480 gives the
+# full 89.9° HFOV, while 640x480 would throw away 10° of scanning width and
+# invalidate the thermal FOV constants below.
+IR_W, IR_H = 848, 480       # capture + display panel, native (never resized)
+TH_W, TH_H = 640, 480       # thermal panel stays 4:3 — the sensor is 256x192
+COMB_W     = IR_W + TH_W    # combined canvas handed to the stream
+
+# Inference shapes are (h, w) and must match the exported NCNN models: the
+# reshape dims are frozen at export time, so these cannot be changed here alone.
+MODEL_MAIN      = "yolov8n-pose-169_ncnn_model"   # 320x192 landscape
+MODEL_ROT       = "yolov8n-pose-rot_ncnn_model"   # 192x320 portrait
+INFER_SHAPE     = (192, 320)
+INFER_SHAPE_ROT = (320, 192)
+
+# The D435 is mounted upside down, so its streams are rotated 180° for display
+# and inference. The thermal cam is assumed still upright — if it shares the
+# bracket and got flipped too, its overlay will sit 180° off from the IR beneath
+# it, so set FLIP_THERMAL_180 as well. Check with a warm object off to one side:
+# it must appear on the same side in both panels.
+FLIP_180         = True
+FLIP_THERMAL_180 = False
+
+# Which D435 IR imager to show and detect on. IR2 is the one at the far end from
+# the RGB camera (64.8 mm vs 14.9 mm), right beside the thermal cam, so its view
+# lines up best with the thermal overlay. Depth is computed from IR1's
+# viewpoint, so depth_at() corrects for the 50 mm stereo baseline.
+IR_INDEX = 2
+
+# Cap on detection rate. The camera runs at 60 fps, but detections at 30 are
+# plenty for a ground robot, and halving inference halves the CPU load — which
+# is most of the Pi's current spikes. 0 = run on every camera frame.
+INFER_MAX_FPS = 30
+
+# NCNN worker threads. Measured on the Pi 5 at 320x192: 2 threads = 12.1 ms,
+# 3 = 12.2 ms, 4 = 11.6 ms — but 4 burns ~1.3 cores vs ~0.7 for 2. The model is
+# too small to parallelise well, so extra threads mostly add power draw.
+NCNN_THREADS = 2
+
 CONF_THRESHOLD = 0.25
 PERSON_CLASS   = 0
 CSV_PATH       = Path("detections.csv")
@@ -41,25 +88,47 @@ CAPTURE_DIR    = Path("captures")
 VIDEO_FPS      = 30
 WIN_TITLE      = "Recon Drone — Human Detection"
 FFC_STD_THRESH = 1.0        # true FFC blanks are near-zero std
+STREAM_PORT    = 8000       # MJPEG feed: http://<pi-ip>:8000/
+STREAM_FPS     = 20         # cap on encode rate, independent of capture FPS
+STREAM_QUALITY = 70         # JPEG quality — lower = smaller payload = less WiFi latency
 
 def find_thermal_device():
-    """Find the Victor 328B by scanning for a UVC device that outputs 256x192."""
+    """Find the Victor 328B via sysfs device names.
+
+    The RealSense's /dev/video* node numbers shift between boots and whenever
+    librealsense claims the device, and its entry in `v4l2-ctl --list-devices`
+    can be empty while claimed — so identify the thermal cam by its stable
+    sysfs name instead, then confirm it offers YUYV 256x192.
+    """
+    import glob
     import subprocess
-    try:
-        devs = subprocess.run(["v4l2-ctl", "--list-devices"],
-                              capture_output=True, text=True).stdout
-        import re
-        for num in sorted(set(re.findall(r"/dev/video(\d+)", devs)), key=int):
+
+    SKIP = ("realsense", "pispbe", "hevc", "isp", "codec")
+    candidates = []
+    for path in glob.glob("/sys/class/video4linux/video*"):
+        num = int(path.rsplit("video", 1)[1])
+        try:
+            with open(f"{path}/name") as fh:
+                name = fh.read().strip()
+        except OSError:
+            continue
+        if any(s in name.lower() for s in SKIP):
+            continue
+        candidates.append((num, name))
+
+    for num, name in sorted(candidates):
+        try:
             out = subprocess.run(["v4l2-ctl", "-d", f"/dev/video{num}",
                                   "--list-formats-ext"],
-                                 capture_output=True, text=True).stdout
-            if "256x192" in out and "YUYV" in out:
-                print(f"  Thermal : detected at /dev/video{num}")
-                return int(num)
-    except Exception:
-        pass
-    print("  Thermal : auto-detect failed — defaulting to /dev/video0")
-    return 0
+                                 capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if "256x192" in out and "YUYV" in out:
+            print(f"  Thermal : detected at /dev/video{num}  ({name})")
+            return num
+
+    print("  Thermal : no 256x192 YUYV device found — thermal disabled")
+    return None
 THERMAL_ALPHA  = 0.40
 
 # FOV-based alignment — D435 IR: 87°×58°  Victor 328B: 56°×42°
@@ -77,17 +146,27 @@ latest_infer         = None
 latest_boxes         = []
 latest_rotated_boxes = []   # boxes from 90°-rotated pass, unrotated back to frame coords
 infer_lock      = threading.Lock()
+infer_cv        = threading.Condition(infer_lock)   # wakes inference on a new frame
+infer_ver       = 0
 boxes_lock      = threading.Lock()
 rotated_lock    = threading.Lock()
 
-# Thermal overlay tuning (adjusted via ox / oy / sz commands)
-therm_offset_x  = 15     # pixel shift right (+) / left (-)
+# Thermal overlay tuning (adjusted via ox / oy / sz commands).
+# therm_scale = the share of the IR frame's WIDTH the thermal image covers; its
+# height follows from the sensor's native 4:3, so the picture is never stretched.
+# The default comes from the FOV ratio in the tangent domain, not a plain angle
+# ratio — image scale goes with tan(θ/2), and the naive version over-sizes the
+# box by ~15%. The old hand-tuned 50/15 values also absorbed the letterbox bug
+# in the 4:3 path (bars counted as FOV), so re-tune from here rather than reusing.
+therm_offset_x  = 0      # pixel shift right (+) / left (-)
 therm_offset_y  = 0      # pixel shift down (+) / up (-)
-therm_scale     = 50     # overlay scale %; 100 = fill frame, 50 = 50% zoom
+therm_scale     = int(round(100 * math.tan(math.radians(VICTOR_FOV_H / 2))
+                                / math.tan(math.radians(D435_IR_FOV_H / 2))))
 
-last_thermal        = np.zeros((480, 640, 3), dtype=np.uint8)
-last_thermal_warped = np.zeros((480, 640, 3), dtype=np.uint8)
-latest_therm_raw    = np.zeros((192, 256),    dtype=np.uint8)
+last_thermal        = np.zeros((TH_H, TH_W, 3), dtype=np.uint8)  # 4:3 panel
+last_thermal_warped = np.zeros((IR_H, IR_W, 3), dtype=np.uint8)  # IR-sized canvas
+therm_box           = (0, 0, 0, 0)   # where the 4:3 overlay actually sits in it
+latest_therm_raw    = np.zeros((192, 256),      dtype=np.uint8)
 thermal_lock        = threading.Lock()
 thermal_ready       = False
 # Percentiles cached by thermal thread at 25 Hz — read freely in main loop
@@ -102,12 +181,13 @@ take_screenshot = False
 
 pipeline     = None
 depth_sensor = None
-depth_w      = 480
-depth_h      = 270
+depth_w      = IR_W
+depth_h      = IR_H
+stereo_k     = 0.0   # fx × baseline (px·m) from depth's viewpoint to IR_INDEX's
 
 # ── Pipeline management ───────────────────────────────────────────────────────
 def start_pipeline(rgb_detection):
-    global pipeline, depth_sensor, depth_w, depth_h, emitter_on
+    global pipeline, depth_sensor, depth_w, depth_h, emitter_on, stereo_k
 
     if pipeline:
         try:
@@ -118,24 +198,29 @@ def start_pipeline(rgb_detection):
     pipeline = rs.pipeline()
     cfg      = rs.config()
 
+    # Both modes run native 848x480 @ 60 now — USB 3 affords it, and keeping
+    # one geometry means display coords == depth coords (lb_scale stays 1.0).
     if rgb_detection:
-        cfg.enable_stream(rs.stream.color,    640, 480, rs.format.bgr8, 30)
-        cfg.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8,  30)
-        cfg.enable_stream(rs.stream.depth,    640, 480, rs.format.z16,  30)
-        depth_w, depth_h = 640, 480
-    else:
-        cfg.enable_stream(rs.stream.infrared, 1, 480, 270, rs.format.y8,  60)
-        cfg.enable_stream(rs.stream.depth,    480, 270, rs.format.z16,  60)
-        depth_w, depth_h = 480, 270
+        cfg.enable_stream(rs.stream.color,    IR_W, IR_H, rs.format.bgr8, 60)
+    cfg.enable_stream(rs.stream.infrared, IR_INDEX, IR_W, IR_H, rs.format.y8, 60)
+    cfg.enable_stream(rs.stream.depth,              IR_W, IR_H, rs.format.z16, 60)
+    depth_w, depth_h = IR_W, IR_H
 
-    pipeline.start(cfg)
-    depth_sensor = pipeline.get_active_profile().get_device().first_depth_sensor()
+    profile = pipeline.start(cfg)
+    depth_sensor = profile.get_device().first_depth_sensor()
+
+    # Read the real baseline from the camera's calibration rather than assuming
+    # 50 mm. For IR1 this comes out ~0 and the correction switches itself off.
+    d_prof  = profile.get_stream(rs.stream.depth)
+    ir_prof = profile.get_stream(rs.stream.infrared, IR_INDEX)
+    fx      = ir_prof.as_video_stream_profile().get_intrinsics().fx
+    stereo_k = fx * d_prof.get_extrinsics_to(ir_prof).translation[0]
     depth_sensor.set_option(rs.option.emitter_enabled, 1 if emitter_on else 0)
 
 # ── Thermal thread ────────────────────────────────────────────────────────────
 def thermal_loop(cap):
     global last_thermal, last_thermal_warped, latest_therm_raw, thermal_ready
-    global therm_p5, therm_p82, therm_p99, therm_version
+    global therm_p5, therm_p82, therm_p99, therm_version, therm_box
     while running:
         ret, frame = cap.read()
         if not ret or frame is None:
@@ -146,56 +231,170 @@ def thermal_loop(cap):
             continue
         if grey.shape[0] == 384:
             grey = grey[:192, :]
+        if FLIP_THERMAL_180:
+            # Flip the raw frame, so the panel, the overlay and every
+            # thermal→IR coordinate mapping all stay consistent downstream.
+            grey = cv2.rotate(grey, cv2.ROTATE_180)
         # Compute percentiles here at 25 Hz so main loop never has to
         flat = grey.flatten().astype(np.float32)
         new_p5  = float(np.percentile(flat,  5))
         new_p82 = float(np.percentile(flat, 82))
         new_p99 = float(np.percentile(flat, 99))
-        coloured = cv2.resize(cv2.applyColorMap(grey, cv2.COLORMAP_INFERNO), (640, 480))
-        scale = therm_scale / 100.0
-        M = np.float32([
-            [scale, 0, 320 * (1 - scale) + therm_offset_x],
-            [0, scale, 240 * (1 - scale) + therm_offset_y],
-        ])
-        warped = cv2.warpAffine(coloured, M, (640, 480))
+        inferno  = cv2.applyColorMap(grey, cv2.COLORMAP_INFERNO)
+        coloured = cv2.resize(inferno, (TH_W, TH_H))          # right-hand panel
+
+        # Overlay keeps the sensor's own 4:3 aspect — stretching it to the IR
+        # frame's 16:9 would smear every feature horizontally by 1.33x and stop
+        # the thermal lining up with what the IR sees. therm_scale sets how much
+        # of the IR width it covers; the height follows from the native aspect.
+        th_h_src, th_w_src = grey.shape[:2]
+        ow = max(1, int(IR_W * therm_scale / 100.0))
+        oh = max(1, int(ow * th_h_src / th_w_src))
+        small = cv2.resize(inferno, (ow, oh))
+
+        warped = np.zeros((IR_H, IR_W, 3), dtype=np.uint8)
+        x0 = (IR_W - ow) // 2 + therm_offset_x
+        y0 = (IR_H - oh) // 2 + therm_offset_y
+        # Clip against the IR frame so offsets can push it part-way off-screen
+        sx0, sy0 = max(0, -x0), max(0, -y0)
+        dx0, dy0 = max(0, x0), max(0, y0)
+        cw = min(ow - sx0, IR_W - dx0)
+        ch = min(oh - sy0, IR_H - dy0)
+        if cw > 0 and ch > 0:
+            warped[dy0:dy0 + ch, dx0:dx0 + cw] = small[sy0:sy0 + ch, sx0:sx0 + cw]
+            box = (dx0, dy0, dx0 + cw, dy0 + ch)
+        else:
+            box = (0, 0, 0, 0)
         with thermal_lock:
             last_thermal[:]                                   = coloured
             last_thermal_warped[:]                            = warped
             latest_therm_raw[:grey.shape[0], :grey.shape[1]] = grey
             therm_p5, therm_p82, therm_p99 = new_p5, new_p82, new_p99
+            therm_box = box
             therm_version += 1
             thermal_ready = True
 
-# ── Inference thread ──────────────────────────────────────────────────────────
-def inference_loop(model):
-    global latest_boxes, latest_rotated_boxes
-    while running:
-        with infer_lock:
-            if latest_infer is None:
-                continue
-            frame = latest_infer.copy()
+# ── MJPEG streaming server ────────────────────────────────────────────────────
+flask_app = Flask(__name__)
 
-        results = model(frame, imgsz=INFERENCE_SIZE, conf=CONF_THRESHOLD,
-                        classes=[PERSON_CLASS], verbose=False)[0]
-        boxes = list(results.boxes) if results.boxes else []
+def lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+# Push-based handoff: main loop → encoder → viewers. No polling, no sleeps, so a
+# frame reaches the browser as soon as it exists rather than on a timer tick.
+frame_cv   = threading.Condition(frame_lock)
+frame_ver  = 0
+
+jpeg_cv    = threading.Condition()
+jpeg_bytes = None
+jpeg_ver   = 0
+
+def jpeg_encoder_loop():
+    """Encode each new frame exactly once, however many viewers are connected."""
+    global jpeg_bytes, jpeg_ver
+    params   = [cv2.IMWRITE_JPEG_QUALITY, STREAM_QUALITY]
+    last_ver = 0
+    while running:
+        with frame_cv:
+            while running and frame_ver == last_ver:
+                frame_cv.wait(0.5)
+            if not running:
+                return
+            frame    = latest_frame   # already a private copy made by the main loop
+            last_ver = frame_ver
+        if frame is None:
+            continue
+        ok, buf = cv2.imencode(".jpg", frame, params)
+        if not ok:
+            continue
+        with jpeg_cv:
+            jpeg_bytes = buf.tobytes()
+            jpeg_ver  += 1
+            jpeg_cv.notify_all()
+
+def mjpeg_generator():
+    last_ver = 0
+    while running:
+        with jpeg_cv:
+            while running and jpeg_ver == last_ver:
+                jpeg_cv.wait(0.5)
+            if not running:
+                return
+            buf      = jpeg_bytes
+            last_ver = jpeg_ver
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf + b"\r\n")
+
+@flask_app.route("/")
+def stream_index():
+    return ("<html><head><title>Recon Drone</title></head>"
+            "<body style='margin:0;background:#000'>"
+            "<img src='/stream' style='width:100%'></body></html>")
+
+@flask_app.route("/stream")
+def stream_route():
+    resp = Response(mjpeg_generator(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    resp.headers["X-Accel-Buffering"] = "no"    # never buffer the stream
+    return resp
+
+def start_stream_server():
+    import logging
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    flask_app.run(host="0.0.0.0", port=STREAM_PORT, threaded=True,
+                  use_reloader=False, debug=False)
+
+# ── Inference thread ──────────────────────────────────────────────────────────
+def inference_loop(model, model_rot):
+    global latest_boxes, latest_rotated_boxes
+    # Block until the camera delivers a frame we haven't inferred yet. The old
+    # loop spun flat out, re-running the network on the same frame on 4 cores —
+    # ~2.5 cores of CPU for nothing, and the CPU current spikes were pulling
+    # the 5V rail down to the brownout threshold.
+    last_ver  = 0
+    min_gap   = 1.0 / INFER_MAX_FPS if INFER_MAX_FPS else 0.0
+    last_run  = 0.0
+    while running:
+        wait = last_run + min_gap - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        with infer_cv:
+            while running and (latest_infer is None or infer_ver == last_ver):
+                infer_cv.wait(0.5)
+            if not running:
+                return
+            frame    = latest_infer     # main loop hands over a fresh array each time
+            last_ver = infer_ver
+        last_run = time.time()
+
+        boxes = model(frame, conf=CONF_THRESHOLD)   # single-class (person) model
 
         # Rotated pass — only when primary finds nobody.
         # A person lying flat looks "standing" when the frame is rotated 90°.
+        # Rotating 848x480 yields a 480x848 portrait frame, so this pass uses
+        # the portrait-exported model; the landscape one would squash it into
+        # a ~108px-wide strip and lose the detection entirely.
         rot_boxes = []
         if not boxes:
             frame_rot = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-            res_rot = model(frame_rot, imgsz=INFERENCE_SIZE, conf=CONF_THRESHOLD,
-                            classes=[PERSON_CLASS], verbose=False)[0]
-            if res_rot.boxes:
-                # Unrotate boxes: 90° CW rotation maps (ox,oy) → (479-oy, ox)
-                # Inverse: (rx,ry) → ox=ry, oy=479-rx
-                for rb in res_rot.boxes:
+            res_rot = model_rot(frame_rot, conf=CONF_THRESHOLD)
+            if res_rot:
+                # Unrotate: 90° CW maps (ox,oy) → (IR_H-1-oy, ox)
+                # Inverse: (rx,ry) → ox=ry, oy=IR_H-1-rx
+                for rb in res_rot:
                     rx1, ry1, rx2, ry2 = map(float, rb.xyxy[0])
                     conf = float(rb.conf[0])
-                    ox1 = int(np.clip(ry1,       0, 639))
-                    oy1 = int(np.clip(479 - rx2, 0, 479))
-                    ox2 = int(np.clip(ry2,       0, 639))
-                    oy2 = int(np.clip(479 - rx1, 0, 479))
+                    ox1 = int(np.clip(ry1, 0, IR_W - 1))
+                    oy1 = int(np.clip(IR_H - 1 - rx2, 0, IR_H - 1))
+                    ox2 = int(np.clip(ry2, 0, IR_W - 1))
+                    oy2 = int(np.clip(IR_H - 1 - rx1, 0, IR_H - 1))
                     if ox1 < ox2 and oy1 < oy2:
                         rot_boxes.append((ox1, oy1, ox2, oy2, conf))
 
@@ -243,7 +442,7 @@ def terminal_listener():
                         str(VIDEO_PATH),
                         cv2.VideoWriter_fourcc(*"XVID"),
                         VIDEO_FPS,
-                        (640, 480),
+                        (IR_W, IR_H),
                     )
                     recording = True
                     print(f"  Recording started → {VIDEO_PATH.resolve()}")
@@ -286,7 +485,7 @@ def terminal_listener():
             break
 
 # ── Frame / coord helpers ─────────────────────────────────────────────────────
-def letterbox(img, out_w=640, out_h=480):
+def letterbox(img, out_w=IR_W, out_h=IR_H):
     h, w = img.shape[:2]
     scale = min(out_w / w, out_h / h)
     nw, nh = int(w * scale), int(h * scale)
@@ -299,30 +498,30 @@ def letterbox(img, out_w=640, out_h=480):
 
 def ir_to_therm_raw(ix, iy):
     """
-    Map IR display (640×480) → thermal sensor (256×192) using FOV angles.
+    Map IR display (IR_W×IR_H) → thermal sensor (256×192) using FOV angles.
     Points outside the thermal FOV are clamped to the thermal frame edge.
     """
-    norm_h = (ix - 320) / 320.0
-    norm_v = (iy - 240) / 240.0
+    norm_h = (ix - IR_W / 2) / (IR_W / 2)
+    norm_v = (iy - IR_H / 2) / (IR_H / 2)
     # Scale by FOV ratio — thermal is more zoomed in, so same angle → larger norm
     tx = 128 + norm_h * (D435_IR_FOV_H / VICTOR_FOV_H) * 128
     ty = 96  + norm_v * (D435_IR_FOV_V / VICTOR_FOV_V) * 96
     return int(np.clip(tx, 0, 255)), int(np.clip(ty, 0, 191))
 
 def therm_raw_to_panel(hx, hy):
-    """Map raw thermal (256×192) → thermal panel display (640×480), applying scale+offset.
+    """Map raw thermal (256×192) → IR display geometry, applying scale+offset.
     Used only for the warped overlay on the IR display — NOT for drawing on the thermal panel."""
-    base_px = hx * 640 / 256
-    base_py = hy * 480 / 192
+    base_px = hx * IR_W / 256
+    base_py = hy * IR_H / 192
     scale = therm_scale / 100.0
-    px = int(320 + scale * (base_px - 320) + therm_offset_x)
-    py = int(240 + scale * (base_py - 240) + therm_offset_y)
+    px = int(IR_W / 2 + scale * (base_px - IR_W / 2) + therm_offset_x)
+    py = int(IR_H / 2 + scale * (base_py - IR_H / 2) + therm_offset_y)
     return px, py
 
 def therm_raw_to_panel_full(hx, hy):
-    """Map raw thermal (256×192) → thermal panel 640×480 without scale/offset.
+    """Map raw thermal (256×192) → thermal panel (TH_W×TH_H) without scale/offset.
     Use this for drawing boxes/crosshairs on the right thermal panel."""
-    return int(hx * 640 / 256), int(hy * 480 / 192)
+    return int(hx * TH_W / 256), int(hy * TH_H / 192)
 
 def ir_to_therm_panel(ix, iy):
     """Map IR display → thermal panel display via FOV mapping + current scale/offset."""
@@ -330,10 +529,39 @@ def ir_to_therm_panel(ix, iy):
     return therm_raw_to_panel(tx, ty)
 
 def therm_raw_to_ir(tx, ty):
-    """Inverse of ir_to_therm_raw: thermal raw (256×192) → IR display (640×480)."""
-    ix = 320 + 320.0 * (tx - 128) * VICTOR_FOV_H / (128.0 * D435_IR_FOV_H)
-    iy = 240 + 240.0 * (ty - 96)  * VICTOR_FOV_V / (96.0  * D435_IR_FOV_V)
-    return int(np.clip(ix, 0, 639)), int(np.clip(iy, 0, 479))
+    """Inverse of ir_to_therm_raw: thermal raw (256×192) → IR display (IR_W×IR_H)."""
+    ix = IR_W / 2 + (IR_W / 2) * (tx - 128) * VICTOR_FOV_H / (128.0 * D435_IR_FOV_H)
+    iy = IR_H / 2 + (IR_H / 2) * (ty - 96)  * VICTOR_FOV_V / (96.0  * D435_IR_FOV_V)
+    return int(np.clip(ix, 0, IR_W - 1)), int(np.clip(iy, 0, IR_H - 1))
+
+def depth_at(depth_frame, dx, dy):
+    """Sample depth for a point given in *display* coordinates.
+
+    librealsense hands us the depth frame in the sensor's own orientation, so
+    when the feed is rotated 180° for the upside-down mount the lookup has to
+    be mirrored back — otherwise every distance comes from the opposite corner
+    of the scene.
+    """
+    if FLIP_180:
+        dx = depth_w - 1 - dx
+        dy = depth_h - 1 - dy
+
+    def sample(x):
+        x = max(0, min(int(round(x)), depth_w - 1))
+        return depth_frame.get_distance(x, max(0, min(dy, depth_h - 1)))
+
+    z = sample(dx)
+    # Depth is seen from IR1, but the image is IR_INDEX's, so the same point
+    # sits stereo_k / Z pixels further along in the depth map. Z is what we're
+    # looking up, so refine twice from the first guess (converges fast, since
+    # the shift only changes slowly with distance).
+    if stereo_k and z > 0:
+        for _ in range(2):
+            z2 = sample(dx - stereo_k / z)
+            if z2 <= 0:
+                break
+            z = z2
+    return z
 
 def thermal_person_candidates(t_raw):
     """Find warm blobs that could be a lying or obscured person.
@@ -368,11 +596,49 @@ def temp_from_raw(t_raw, hx, hy, patch=4):
 lb_x, lb_y, lb_scale = 0, 0, 1.0
 
 # ── HUD helpers ───────────────────────────────────────────────────────────────
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+def _deg_radius(scale):
+    return max(2, int(round(scale * 4)))
+
+def text_size(text, scale, thickness):
+    """getTextSize that accounts for '°' being drawn as a circle, not a glyph."""
+    parts = text.split("°")
+    w, h = 0, 0
+    for part in parts:
+        if part:
+            (pw, ph), _ = cv2.getTextSize(part, FONT, scale, thickness)
+            w += pw
+            h = max(h, ph)
+    if h == 0:
+        (_, h), _ = cv2.getTextSize("0", FONT, scale, thickness)
+    w += (len(parts) - 1) * (2 * _deg_radius(scale) + 3)
+    return w, h
+
+def put_text(img, text, org, scale, colour, thickness):
+    """cv2.putText with degree-sign support.
+
+    Hershey fonts are ASCII-only, so a literal '°' renders as '??'. Draw each
+    one as a small ring instead and lay out the surrounding text around it.
+    """
+    x, y = org
+    parts = text.split("°")
+    for i, part in enumerate(parts):
+        if i:
+            r = _deg_radius(scale)
+            (_, ch), _ = cv2.getTextSize("C", FONT, scale, thickness)
+            cv2.circle(img, (x + r + 1, y - ch + r), r, colour,
+                       max(1, thickness - 1), cv2.LINE_AA)
+            x += 2 * r + 3
+        if part:
+            cv2.putText(img, part, (x, y), FONT, scale, colour, thickness)
+            x += cv2.getTextSize(part, FONT, scale, thickness)[0][0]
+
 def hud_text(img, text, pos, scale=0.7, colour=(0, 220, 255), thickness=2):
-    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    tw, th = text_size(text, scale, thickness)
     x, y = pos
     cv2.rectangle(img, (x - 2, y - th - 4), (x + tw + 2, y + 4), (0, 0, 0), -1)
-    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, colour, thickness)
+    put_text(img, text, (x, y), scale, colour, thickness)
 
 def draw_crosshair(img, cx, cy, colour, size=16, thickness=2):
     cv2.drawMarker(img, (cx, cy), colour, cv2.MARKER_CROSS, size, thickness)
@@ -394,37 +660,58 @@ def draw_box(img, x1, y1, x2, y2, conf, dist_m, temp_c=None):
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
     if temp_c is not None:
         tlabel = f"~{temp_c:.1f}°C"
-        (tw2, th2), _ = cv2.getTextSize(tlabel, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+        tw2, th2 = text_size(tlabel, 0.65, 2)
         cv2.rectangle(img, (x1 - 2, y2 + 2), (x1 + tw2 + 4, y2 + th2 + 8), (0, 0, 0), -1)
-        cv2.putText(img, tlabel, (x1 + 2, y2 + th2 + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 165, 255), 2)
+        put_text(img, tlabel, (x1 + 2, y2 + th2 + 4), 0.65, (0, 165, 255), 2)
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 CAPTURE_DIR.mkdir(exist_ok=True)
 
 print("\n  Recon Drone — Human Detection System")
 print("  ─────────────────────────────────────")
-print("  Model   : YOLOv8n-pose NCNN")
-print("  Camera  : Intel RealSense D435  (87°×58° IR FOV)")
+print(f"  Model   : YOLOv8n-pose NCNN  {INFER_SHAPE[1]}x{INFER_SHAPE[0]} + rotated pass")
+print(f"  Camera  : Intel RealSense D435  {IR_W}x{IR_H} @60  (89.9°×59° IR FOV)")
 print("  Thermal : Victor 328B (56°×42° FOV — auto-detected)")
 print("  Commands: i d e r s  |  ox <px>  oy <px>  sz <pct>  |  q=quit")
 print("  Hotspot : RED=global  YELLOW=within detection\n")
 
-model = YOLO("yolov8n-pose_ncnn_model", task="pose")
+model     = PoseNet(MODEL_MAIN, INFER_SHAPE,     threads=NCNN_THREADS)
+model_rot = PoseNet(MODEL_ROT,  INFER_SHAPE_ROT, threads=NCNN_THREADS)
 start_pipeline(detect_rgb)
 
-thermal_cap = cv2.VideoCapture(find_thermal_device())
-thermal_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-if not thermal_cap.isOpened():
-    print("  [!] Thermal camera not found — thermal disabled")
+thermal_idx = find_thermal_device()
+thermal_cap = None
+if thermal_idx is not None:
+    # CAP_V4L2 explicitly — the default backend can fall through to FFMPEG,
+    # which adds buffering latency and spams "Not a video capture device".
+    thermal_cap = cv2.VideoCapture(thermal_idx, cv2.CAP_V4L2)
+    thermal_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+    thermal_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # always read the freshest frame
+    thermal_cap.set(cv2.CAP_PROP_FPS, 25)
+    if not thermal_cap.isOpened():
+        thermal_cap.release()
+        thermal_cap = None
+if thermal_cap is None:
+    print("  [!] Thermal camera unavailable — running IR/depth only")
 
 threading.Thread(target=terminal_listener, daemon=True).start()
-threading.Thread(target=inference_loop, args=(model,), daemon=True).start()
-threading.Thread(target=thermal_loop,   args=(thermal_cap,), daemon=True).start()
+threading.Thread(target=inference_loop, args=(model, model_rot), daemon=True).start()
+if thermal_cap is not None:
+    threading.Thread(target=thermal_loop, args=(thermal_cap,), daemon=True).start()
+threading.Thread(target=jpeg_encoder_loop,   daemon=True).start()
+threading.Thread(target=start_stream_server, daemon=True).start()
+print(f"  Stream  : http://{lan_ip()}:{STREAM_PORT}/  (view on PC/phone browser)")
 
-cv2.namedWindow(WIN_TITLE, cv2.WINDOW_NORMAL)
-cv2.resizeWindow(WIN_TITLE, 1280, 480)
-cv2.moveWindow(WIN_TITLE, 0, 0)
+show_window = bool(os.environ.get("DISPLAY"))
+if show_window:
+    try:
+        cv2.namedWindow(WIN_TITLE, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WIN_TITLE, COMB_W, IR_H)
+        cv2.moveWindow(WIN_TITLE, 0, 0)
+    except cv2.error:
+        show_window = False
+if not show_window:
+    print("  [!] No local display — skipping cv2 window (use the stream URL above, or 'q' + Enter to quit)")
 
 csv_file   = CSV_PATH.open("w", newline="")
 csv_writer = csv.writer(csv_file)
@@ -437,14 +724,17 @@ was_detecting      = False  # IR detection state
 was_therm_detecting = False  # thermal fallback state
 video_writer      = None
 recording         = False
-combined          = np.empty((480, 1280, 3), dtype=np.uint8)  # pre-allocated, reused every frame
+combined          = np.empty((IR_H, COMB_W, 3), dtype=np.uint8)  # pre-allocated, reused every frame
 _last_therm_ver   = -1
-t_coloured        = np.zeros((480, 640, 3), dtype=np.uint8)
-t_warped          = np.zeros((480, 640, 3), dtype=np.uint8)
+t_coloured        = np.zeros((TH_H, TH_W, 3), dtype=np.uint8)
+t_warped          = np.zeros((IR_H, IR_W, 3), dtype=np.uint8)
 
 fps_counter = 0
 fps_display = 0.0
 fps_timer   = time.time()
+
+STREAM_PERIOD   = 1.0 / STREAM_FPS
+last_stream_pub = 0.0
 
 print("  Streaming — IR detection active\n")
 
@@ -461,7 +751,7 @@ try:
             continue
 
         depth_frame  = frames.get_depth_frame()
-        ir_frame     = frames.get_infrared_frame(1)
+        ir_frame     = frames.get_infrared_frame(IR_INDEX)
         colour_frame = frames.get_color_frame() if detect_rgb else None
 
         if not depth_frame or not ir_frame:
@@ -470,15 +760,21 @@ try:
             continue
 
         ir_raw = cv2.cvtColor(np.asanyarray(ir_frame.get_data()), cv2.COLOR_GRAY2BGR)
-        if ir_raw.shape[:2] == (480, 640):
+        if FLIP_180:
+            ir_raw = cv2.rotate(ir_raw, cv2.ROTATE_180)
+        if ir_raw.shape[:2] == (IR_H, IR_W):
             ir_bgr = ir_raw
             lb_x, lb_y, lb_scale = 0, 0, 1.0
         else:
             ir_bgr, lb_x, lb_y, lb_scale = letterbox(ir_raw)  # noqa: F841
         rgb = np.asanyarray(colour_frame.get_data()) if colour_frame else None
+        if FLIP_180 and rgb is not None:
+            rgb = cv2.rotate(rgb, cv2.ROTATE_180)
 
-        with infer_lock:
+        with infer_cv:
             latest_infer = rgb.copy() if (detect_rgb and rgb is not None) else ir_bgr.copy()
+            infer_ver   += 1
+            infer_cv.notify()
 
         display = rgb.copy() if (not ir_mode and rgb is not None) else ir_bgr.copy()
 
@@ -487,15 +783,21 @@ try:
             cur_ver = therm_version
             t_raw   = latest_therm_raw.copy()
             t_ready = thermal_ready
+            t_box   = therm_box
             if cur_ver != _last_therm_ver:
                 t_coloured = last_thermal.copy()
                 t_warped   = last_thermal_warped.copy()
                 _last_therm_ver = cur_ver
 
-        # ── Thermal overlay — use cached warped frame (no per-frame warpAffine) ─
+        # ── Thermal overlay — blend only where thermal data actually exists ────
+        # Blending the whole frame would mix the IR with black everywhere the
+        # thermal cam can't see, dimming the wider part of the view by 40%.
         if t_ready:
-            display = cv2.addWeighted(
-                display, 1.0 - THERMAL_ALPHA, t_warped, THERMAL_ALPHA, 0)
+            bx1, by1, bx2, by2 = t_box
+            if bx2 > bx1 and by2 > by1:
+                display[by1:by2, bx1:bx2] = cv2.addWeighted(
+                    display[by1:by2, bx1:bx2], 1.0 - THERMAL_ALPHA,
+                    t_warped[by1:by2, bx1:bx2], THERMAL_ALPHA, 0)
 
         with boxes_lock:
             boxes = list(latest_boxes)
@@ -525,13 +827,13 @@ try:
         for box in boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             conf = float(box.conf[0])
-            cx   = max(0, min((x1 + x2) // 2, 639))
-            cy   = max(0, min((y1 + y2) // 2, 479))
+            cx   = max(0, min((x1 + x2) // 2, IR_W - 1))
+            cy   = max(0, min((y1 + y2) // 2, IR_H - 1))
 
             # Depth
             dcx    = max(0, min(int((cx - lb_x) / lb_scale), depth_w - 1))
             dcy    = max(0, min(int((cy - lb_y) / lb_scale), depth_h - 1))
-            dist_m = depth_frame.get_distance(dcx, dcy)
+            dist_m = depth_at(depth_frame, dcx, dcy)
 
             # Temperature at box centre
             hx_c, hy_c = ir_to_therm_raw(cx, cy)
@@ -545,10 +847,10 @@ try:
                 rx2, ry2 = ir_to_therm_raw(x2, y2)
                 tp_x1, tp_y1 = therm_raw_to_panel_full(rx1, ry1)
                 tp_x2, tp_y2 = therm_raw_to_panel_full(rx2, ry2)
-                tp_x1 = max(0, min(tp_x1, 639))
-                tp_x2 = max(0, min(tp_x2, 639))
-                tp_y1 = max(0, min(tp_y1, 479))
-                tp_y2 = max(0, min(tp_y2, 479))
+                tp_x1 = max(0, min(tp_x1, TH_W - 1))
+                tp_x2 = max(0, min(tp_x2, TH_W - 1))
+                tp_y1 = max(0, min(tp_y1, TH_H - 1))
+                tp_y2 = max(0, min(tp_y2, TH_H - 1))
 
                 if tp_x1 < tp_x2 and tp_y1 < tp_y2:
                     cv2.rectangle(thermal_panel, (tp_x1, tp_y1),
@@ -579,7 +881,7 @@ try:
             cy_r = (y1r + y2r) // 2
             dcx_r = max(0, min(int((cx_r - lb_x) / lb_scale), depth_w - 1))
             dcy_r = max(0, min(int((cy_r - lb_y) / lb_scale), depth_h - 1))
-            dist_r = depth_frame.get_distance(dcx_r, dcy_r)
+            dist_r = depth_at(depth_frame, dcx_r, dcy_r)
             hx_r, hy_r = ir_to_therm_raw(cx_r, cy_r)
             temp_r = temp_from_raw(t_raw, hx_r, hy_r) if t_ready else None
             # IR display — orange box
@@ -599,19 +901,18 @@ try:
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 140, 255), 2)
             if temp_r is not None:
                 tl_r = f"~{temp_r:.1f}°C"
-                (tw2, th2), _ = cv2.getTextSize(tl_r, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+                tw2, th2 = text_size(tl_r, 0.65, 2)
                 cv2.rectangle(display, (x1r - 2, y2r + 2),
                               (x1r + tw2 + 4, y2r + th2 + 8), (0, 0, 0), -1)
-                cv2.putText(display, tl_r, (x1r + 2, y2r + th2 + 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 140, 255), 2)
+                put_text(display, tl_r, (x1r + 2, y2r + th2 + 4), 0.65, (0, 140, 255), 2)
             # Thermal panel — project box
             if t_ready:
                 trx1, try1 = ir_to_therm_raw(x1r, y1r)
                 trx2, try2 = ir_to_therm_raw(x2r, y2r)
                 ttp_x1, ttp_y1 = therm_raw_to_panel_full(trx1, try1)
                 ttp_x2, ttp_y2 = therm_raw_to_panel_full(trx2, try2)
-                ttp_x1 = max(0, min(ttp_x1, 639)); ttp_x2 = max(0, min(ttp_x2, 639))
-                ttp_y1 = max(0, min(ttp_y1, 479)); ttp_y2 = max(0, min(ttp_y2, 479))
+                ttp_x1 = max(0, min(ttp_x1, TH_W - 1)); ttp_x2 = max(0, min(ttp_x2, TH_W - 1))
+                ttp_y1 = max(0, min(ttp_y1, TH_H - 1)); ttp_y2 = max(0, min(ttp_y2, TH_H - 1))
                 if ttp_x1 < ttp_x2 and ttp_y1 < ttp_y2:
                     cv2.rectangle(thermal_panel, (ttp_x1, ttp_y1),
                                   (ttp_x2, ttp_y2), (0, 140, 255), 2)
@@ -647,7 +948,7 @@ try:
                 cx_rl = (x1r + x2r) // 2; cy_rl = (y1r + y2r) // 2
                 dcx_rl = max(0, min(int((cx_rl - lb_x) / lb_scale), depth_w - 1))
                 dcy_rl = max(0, min(int((cy_rl - lb_y) / lb_scale), depth_h - 1))
-                dist_rl = depth_frame.get_distance(dcx_rl, dcy_rl)
+                dist_rl = depth_at(depth_frame, dcx_rl, dcy_rl)
                 hx_rl, hy_rl = ir_to_therm_raw(cx_rl, cy_rl)
                 temp_rl = temp_from_raw(t_raw, hx_rl, hy_rl) if t_ready else None
                 csv_writer.writerow([now, "IR-ROT", disp_mode,
@@ -658,11 +959,11 @@ try:
             for box in boxes:
                 x1l, y1l, x2l, y2l = map(int, box.xyxy[0])
                 conf_l = float(box.conf[0])
-                cx_l   = max(0, min((x1l + x2l) // 2, 639))
-                cy_l   = max(0, min((y1l + y2l) // 2, 479))
+                cx_l   = max(0, min((x1l + x2l) // 2, IR_W - 1))
+                cy_l   = max(0, min((y1l + y2l) // 2, IR_H - 1))
                 dcx_l  = max(0, min(int((cx_l - lb_x) / lb_scale), depth_w - 1))
                 dcy_l  = max(0, min(int((cy_l - lb_y) / lb_scale), depth_h - 1))
-                dist_l = depth_frame.get_distance(dcx_l, dcy_l)
+                dist_l = depth_at(depth_frame, dcx_l, dcy_l)
                 hx_l, hy_l = ir_to_therm_raw(cx_l, cy_l)
                 temp_l = temp_from_raw(t_raw, hx_l, hy_l) if t_ready else None
                 csv_writer.writerow([now, detect_src, disp_mode,
@@ -683,7 +984,7 @@ try:
                 ix_c, iy_c = therm_raw_to_ir(tcx, tcy)
                 dcx_t = max(0, min(int((ix_c - lb_x) / lb_scale), depth_w - 1))
                 dcy_t = max(0, min(int((iy_c - lb_y) / lb_scale), depth_h - 1))
-                dist_t = depth_frame.get_distance(dcx_t, dcy_t)
+                dist_t = depth_at(depth_frame, dcx_t, dcy_t)
                 temp_t = temp_from_raw(t_raw, tcx, tcy)
                 csv_writer.writerow([now, "THERM", disp_mode,
                                      "", f"{dist_t:.3f}", f"{temp_t:.1f}",
@@ -710,18 +1011,18 @@ try:
         if total_logged:
             hud_text(display, f"Logged: {total_logged}", (8, 96), colour=(180, 255, 180))
         if boxes:
-            hud_text(display, "DETECTED", (640 - 120, 28), colour=(0, 60, 255), scale=0.8)
+            hud_text(display, "DETECTED", (IR_W - 120, 28), colour=(0, 60, 255), scale=0.8)
         elif rotated_boxes:
-            hud_text(display, "DETECTED (lying)", (640 - 200, 28), colour=(0, 140, 255), scale=0.8)
+            hud_text(display, "DETECTED (lying)", (IR_W - 200, 28), colour=(0, 140, 255), scale=0.8)
         elif therm_candidates:
-            hud_text(display, f"HEAT SIG x{len(therm_candidates)}", (640 - 160, 28),
+            hud_text(display, f"HEAT SIG x{len(therm_candidates)}", (IR_W - 160, 28),
                      colour=(0, 220, 255), scale=0.7)
         if recording:
-            hud_text(display, "REC", (640 - 60, 62), colour=(0, 0, 255), scale=0.7)
+            hud_text(display, "REC", (IR_W - 60, 62), colour=(0, 0, 255), scale=0.7)
             video_writer.write(display)
 
-        combined[:, :640]  = display
-        combined[:, 640:]  = thermal_panel
+        combined[:, :IR_W]  = display
+        combined[:, IR_W:]  = thermal_panel
 
         # Screenshot
         if take_screenshot:
@@ -731,12 +1032,20 @@ try:
             print(f"  Screenshot saved → {fpath.resolve()}")
             take_screenshot = False
 
-        with frame_lock:
-            latest_frame = combined
+        # Publish to the stream — throttled to STREAM_FPS so JPEG encoding never
+        # steals CPU from inference. `combined` is reused in place every frame,
+        # so hand the encoder its own copy rather than a reference to it.
+        if time.time() - last_stream_pub >= STREAM_PERIOD:
+            with frame_cv:
+                latest_frame = combined.copy()
+                frame_ver   += 1
+                frame_cv.notify_all()
+            last_stream_pub = time.time()
 
-        cv2.imshow(WIN_TITLE, combined)
+        if show_window:
+            cv2.imshow(WIN_TITLE, combined)
 
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(1) & 0xFF if show_window else 0xFF
         if key == ord('q'):
             break
         elif key == ord('i'):
@@ -760,7 +1069,7 @@ try:
                 video_writer = cv2.VideoWriter(
                     str(VIDEO_PATH),
                     cv2.VideoWriter_fourcc(*"XVID"),
-                    VIDEO_FPS, (640, 480),
+                    VIDEO_FPS, (IR_W, IR_H),
                 )
                 recording = True
             else:
@@ -772,11 +1081,16 @@ try:
 
 finally:
     running = False
+    with frame_cv:            # wake the encoder and any connected viewers
+        frame_cv.notify_all()
+    with jpeg_cv:
+        jpeg_cv.notify_all()
     time.sleep(0.3)           # let threads see running=False before releasing devices
     if recording and video_writer:
         video_writer.release()
     csv_file.close()
-    thermal_cap.release()
+    if thermal_cap is not None:
+        thermal_cap.release()
     try:
         pipeline.stop()
     except Exception:
