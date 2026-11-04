@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0a0e14">
+<title>Recon Drone</title>
+<link rel="manifest" href="/manifest.json">
+<style>
+  /* Barlow Condensed: free face close to Rainbow Six Siege's HUD, served by web.py from pi/fonts */
+  @font-face { font-family:"Barlow Condensed"; font-weight:500; src:url(/fonts/bc500.woff2) format("woff2"); }
+  @font-face { font-family:"Barlow Condensed"; font-weight:600; src:url(/fonts/bc600.woff2) format("woff2"); }
+  @font-face { font-family:"Barlow Condensed"; font-weight:700; src:url(/fonts/bc700.woff2) format("woff2"); }
+  /* Blue is the drone (own side), orange is a person found, red is danger */
+  :root { --bg:#0a0e14; --fg:#f2f4f7; --dim:#9aa3ad; --blue:#2a9df4; --orange:#ff8c1a; --pin:#ffd21f; --bad:#ff3b3b;
+    --glass:rgba(10,14,20,.55); --line:rgba(242,244,247,.45); --faint:rgba(242,244,247,.18);
+    --l:max(16px,env(safe-area-inset-left)); --r:max(16px,env(safe-area-inset-right));
+    --t:max(8px,env(safe-area-inset-top)); --b:max(8px,env(safe-area-inset-bottom)); }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; -webkit-touch-callout:none; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); overflow:hidden;
+    font:600 13px/1.2 "Barlow Condensed","Segoe UI",Roboto,system-ui,sans-serif; touch-action:none; user-select:none; -webkit-user-select:none; }
+  #video { position:fixed; inset:0; width:100%; height:100%; object-fit:contain; background:#000; }
+  /* Fullscreen fills the phone's width and crops top and bottom instead of black bars at the sides */
+  .fs #video { object-fit:cover; }
+  @media (display-mode:fullscreen), (display-mode:standalone) { #video { object-fit:cover; } }
+  .fs #full { display:none; }
+  #nofeed { position:fixed; inset:0; display:grid; place-items:center; color:var(--dim); letter-spacing:.15em; }
+  /* Sticks: invisible until a touch lands in or just round their circle (::before widens the hit area by 24px),
+     then a faint grey ring and knob while held */
+  .stick { position:fixed; bottom:calc(var(--b) + 92px); width:130px; height:130px; border-radius:50%;
+    border:1px solid transparent; }
+  .stick::before { content:""; position:absolute; inset:-24px; border-radius:50%; }
+  /* inside the edge rules (4.5%) with room for the 24px hit ring */
+  #sl { left:calc(4.5% + 36px); } #sr { right:calc(4.5% + 36px); }
+  .stick.held { border-color:rgba(200,204,210,.3); background:rgba(200,204,210,.06); }
+  .stick i { position:absolute; left:50%; top:50%; width:52px; height:52px; margin:-26px 0 0 -26px; border-radius:50%;
+    background:rgba(200,204,210,.25); border:1px solid rgba(200,204,210,.4); pointer-events:none; visibility:hidden; }
+  .stick.held i { visibility:visible; }
+  .stick b { position:absolute; left:0; right:0; top:50%; margin-top:-6px; text-align:center; color:rgba(200,204,210,.35);
+    font-size:10px; letter-spacing:.15em; font-weight:400; pointer-events:none; visibility:hidden; }
+  .ui { position:fixed; pointer-events:none; }
+  .ui button { pointer-events:auto; }
+
+  /* Camera frame: two edge rules and two crosses, all above the sticks */
+  #frame { inset:0; }
+  #frame .rule { position:absolute; top:6%; bottom:6%; width:1px; background:var(--faint); }
+  #frame .rule::before, #frame .rule::after { content:""; position:absolute; left:-5px; width:11px; height:1px; background:var(--faint); }
+  #frame .rule::before { top:0; } #frame .rule::after { bottom:0; }
+  #frame .x { position:absolute; width:22px; height:22px; margin:-11px 0 0 -11px;
+    background:linear-gradient(var(--faint),var(--faint)) center/1px 100% no-repeat, linear-gradient(var(--faint),var(--faint)) center/100% 1px no-repeat; }
+
+  /* Top bar */
+  #bar { top:var(--t); left:50%; transform:translateX(-50%); display:flex; align-items:stretch; height:30px; }
+  /* Fixed widths so the bar keeps its shape whatever the text */
+  #bar > div { display:flex; align-items:center; justify-content:center; gap:8px; width:120px; white-space:nowrap; overflow:hidden; }
+  #us { background:linear-gradient(90deg,rgba(42,157,244,.15),rgba(42,157,244,.85)); clip-path:polygon(10px 0,100% 0,100% 100%,0 100%); font-size:13px; }
+  #mid { background:var(--glass); font-size:14px; width:110px !important; }
+  #them { background:linear-gradient(270deg,rgba(255,140,26,.15),rgba(255,140,26,.85)); clip-path:polygon(0 0,calc(100% - 10px) 0,100% 100%,0 100%); }
+  #them.hot { background:var(--orange); }
+  #them svg { width:14px; height:14px; fill:currentColor; }
+  #pers { font-size:15px; }
+  #alert { top:calc(var(--t) + 36px); left:50%; transform:translateX(-50%); padding:3px 12px;
+    background:var(--bad); color:#fff; letter-spacing:.12em; white-space:nowrap; }
+  #alert.find { background:var(--orange); }
+  .ok { color:var(--fg); } .warn { color:var(--orange); }
+  .bad { color:#fff; background:var(--bad); padding:1px 5px; }
+
+  /* Top left: camera. Top right: fullscreen, clear, power off. Lights and safety sit left of the compass, see #aids */
+  #tools { top:var(--t); left:var(--l); display:flex; gap:6px; }
+  #rgbm { font-size:11px; }
+  #danger { top:var(--t); right:var(--r); display:flex; gap:6px; align-items:stretch; }
+  #tip { padding:4px 8px; background:var(--glass); color:var(--fg); font-size:11px; letter-spacing:.06em; white-space:nowrap; z-index:5; }
+  button { font:inherit; color:var(--fg); background:var(--glass); border:1px solid var(--faint); padding:6px 8px; letter-spacing:.06em;
+    display:inline-flex; align-items:center; gap:4px; min-height:32px; }
+  button svg { width:18px; height:18px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+  button.on { color:var(--blue); border-color:var(--blue); }
+
+  /* Bottom left: telemetry. Bottom right: battery */
+  #left { left:var(--l); bottom:var(--b); text-shadow:0 1px 2px #000; }
+  #batt { right:var(--r); bottom:var(--b); text-align:right; text-shadow:0 1px 2px #000; }
+  #batt #battbar { margin-left:auto; }
+  #battnum { font-size:26px; line-height:1; } #battnum small { font-size:13px; color:var(--dim); }
+  #battbar { width:120px; height:5px; background:rgba(242,244,247,.2); margin-top:3px; }
+  #battbar i { display:block; height:100%; width:0; background:var(--fg); }
+  #battv { color:var(--dim); font-size:11px; margin-top:2px; }
+  #tele { color:var(--dim); font-size:10px; font-weight:400; letter-spacing:.04em; white-space:nowrap; }
+  #tele b { font-weight:400; margin-right:3px; }
+
+  /* Bottom centre: compass dead centre, heading over it, buttons to its left, readouts to its right */
+  #compass { left:50%; bottom:var(--b); transform:translateX(-50%); display:flex; flex-direction:column; align-items:center; gap:3px; }
+  #hdg { font-size:13px; text-shadow:0 1px 2px #000; }
+  /* canvas has a clear margin round the ring so pins at the top are not cut off */
+  #comp { width:114px; height:114px; margin-top:-12px; }
+  #reads { left:calc(50% + 64px); bottom:calc(var(--b) + 6px); display:flex; flex-direction:column; gap:3px; min-width:84px; text-shadow:0 1px 2px #000; }
+  #reads b { color:var(--dim); font-weight:400; margin-right:4px; font-size:10px; }
+  /* Below the sticks' hit rings, above the telemetry line. Lights, a wider gap, then safety */
+  #aids { right:calc(50% + 64px); bottom:calc(var(--b) + 18px); display:flex; gap:6px; }
+  #aids .gap { width:8px; }
+
+  #spin { left:50%; top:45%; transform:translate(-50%,-50%); padding:8px 16px; background:var(--glass); color:var(--orange); letter-spacing:.15em; }
+  #rotate { display:none; position:fixed; inset:0; background:var(--bg); place-items:center; text-align:center; padding:24px; color:var(--dim); }
+  @media (orientation:portrait) { #rotate { display:grid; } }
+  @media (max-height:360px) { #comp { width:98px; height:98px; margin-top:-10px; } .stick { width:112px; height:112px; bottom:calc(var(--b) + 86px); } }
+  /* Are-you-sure popup for clear and power off */
+  #ask { position:fixed; inset:0; display:grid; place-items:center; background:rgba(0,0,0,.45); z-index:10; }
+  #ask[hidden] { display:none; }
+  #ask > div { background:var(--bg); border:1px solid var(--faint); padding:16px 18px; display:flex; flex-direction:column; gap:14px;
+    min-width:240px; text-align:center; }
+  #askq { font-size:14px; letter-spacing:.06em; }
+  #ask p { margin:0; color:var(--dim); font-weight:400; }
+  #ask .row { display:flex; gap:10px; justify-content:center; }
+  #ask button { min-width:96px; justify-content:center; }
+  #askyes { background:var(--bad); border-color:var(--bad); color:#fff; }
+</style>
+</head>
+<body>
+<div id="nofeed">NO CAMERA FEED</div>
+<img id="video" alt="">
+<div class="ui" id="frame">
+  <div class="rule" style="left:4.5%"></div><div class="rule" style="right:4.5%"></div>
+  <div class="x" style="left:16%;top:20%"></div><div class="x" style="left:84%;top:20%"></div>
+  <div class="x" style="left:16%;top:80%"></div><div class="x" style="left:84%;top:80%"></div>
+</div>
+<div class="stick" id="sl"><i></i><b>DRIVE</b></div><div class="stick" id="sr"><i></i><b>TURN</b></div>
+
+<div class="ui" id="bar">
+  <div id="us"><span id="spd">--</span></div>
+  <div id="mid"><span id="vname">--</span></div>
+  <div id="them"><svg viewBox="0 0 16 16"><circle cx="8" cy="4" r="3"/><path d="M2 16c0-4 2.5-6.5 6-6.5s6 2.5 6 6.5z"/></svg><span id="pers">0</span></div>
+</div>
+<div class="ui" id="alert" hidden></div>
+
+<div class="ui" id="tools">
+  <button id="view" title="Camera: IR or colour"><svg viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg></button>
+  <button id="heat" title="Heat: over the camera, heat only, off"><svg viewBox="0 0 24 24"><path d="M12 22a7 7 0 01-7-7c0-4 3-6 4-10 2 2 3 4 3 6 1-1 2-2 2-4 3 2 5 5 5 8a7 7 0 01-7 7z"/></svg></button>
+  <button id="snap" title="Save a snapshot"><svg viewBox="0 0 24 24"><path d="M3 8h4l2-3h6l2 3h4v12H3z"/><circle cx="12" cy="13.5" r="3.5"/></svg></button>
+
+</div>
+<div class="ui" id="aids">
+  <button id="ir" title="Infrared LEDs on or off"><svg viewBox="0 0 24 24"><path d="M20 14A8 8 0 1110 4a7 7 0 0010 10z"/></svg></button>
+  <button id="rgb" title="RGB LEDs: status colours, white, off"><svg viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 00-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0012 3z"/></svg><span id="rgbm"></span></button>
+  <span class="gap"></span>
+  <button id="halt" title="Auto halt when a person is found"><svg viewBox="0 0 24 24"><path d="M8 13V6.5a1.5 1.5 0 013 0V11V4.5a1.5 1.5 0 013 0V11V6a1.5 1.5 0 013 0v8.5a6.5 6.5 0 01-6.5 6.5h-.5a5 5 0 01-4.2-2.3L4 14.5a1.5 1.5 0 012.4-1.8z"/></svg></button>
+  <button id="avoid" title="Obstacle stop on or off"><svg viewBox="0 0 24 24"><path d="M12 3l9 16H3zM12 10v4M12 16.5v.5"/></svg></button>
+</div>
+<div class="ui" id="danger">
+  <button id="full" title="Fullscreen"><svg viewBox="0 0 24 24"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/></svg></button>
+  <button id="clr" title="Clear person pins, reset heading"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg></button>
+  <button id="power" title="Shut the Pi down"><svg viewBox="0 0 24 24"><path d="M12 3v9"/><path d="M6.3 6.3a8 8 0 1011.4 0"/></svg></button>
+</div>
+<div class="ui" id="tip" hidden></div>
+<div id="ask" hidden><div><div id="askq"></div><p id="askp"></p>
+  <div class="row"><button id="askno">CANCEL</button><button id="askyes"></button></div></div></div>
+
+<div class="ui" id="batt"><div id="battnum">--<small> %</small></div><div id="battbar"><i></i></div><div id="battv">BATTERY</div></div>
+<div class="ui" id="left">
+  <div id="tele"><b>AI</b><span id="ai">--</span> &nbsp;<b>PING</b><span id="ping">--</span> &nbsp;<span id="temp">--</span></div>
+</div>
+
+<div class="ui" id="compass"><span id="hdg">--</span><canvas id="comp"></canvas></div>
+<div class="ui" id="reads"><span><b>AHEAD</b><span id="ahead">--</span></span><span><b>HUB</b><span id="tilt">--</span></span></div>
+
+<div class="ui" id="spin" hidden>SPINNING 180</div>
+<div id="rotate">Turn your phone sideways to drive.</div>
+<script>
+const $ = id => document.getElementById(id);   // not window globals: window.stop is a built-in
+const [sl, sr, nofeed, spd, tilt, power, full] =
+  ['sl', 'sr', 'nofeed', 'spd', 'tilt', 'power', 'full'].map($);
+const WHEEL_R = 0.0589;                          // wheel radius m (drive.py WHEEL_D / 2)
+const sticks = { l: { el: sl, id: null, x: 0, y: 0 }, r: { el: sr, id: null, x: 0, y: 0 } };
+let sending = 0;
+
+// Video: read /frames (4-byte length + JPEG) ourselves so a stalled stream is noticed and reopened. An <img> on
+// the MJPEG stream could freeze black without any error until the page was refreshed.
+const video = $('video');
+let vctrl = null, lastFrame = 0, decoding = false;
+function showFrame(jpg) {
+  lastFrame = performance.now(); nofeed.hidden = true;
+  if (decoding) return;                          // phone still decoding the last one: drop this frame
+  decoding = true;
+  const old = video.src; video.src = URL.createObjectURL(new Blob([jpg], { type: 'image/jpeg' }));
+  video.decode().catch(() => {}).finally(() => { if (old.startsWith('blob:')) URL.revokeObjectURL(old); decoding = false; });
+}
+async function startVideo() {
+  if (vctrl) vctrl.abort();
+  const ctrl = vctrl = new AbortController(); lastFrame = performance.now(); decoding = false;
+  try {
+    const rd = (await fetch('/frames?' + Date.now(), { signal: ctrl.signal, cache: 'no-store' })).body.getReader();
+    let buf = new Uint8Array(0);
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      const b = new Uint8Array(buf.length + value.length); b.set(buf); b.set(value, buf.length); buf = b;
+      while (buf.length >= 4) {
+        const n = ((buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3]) >>> 0;
+        if (buf.length < 4 + n) break;
+        showFrame(buf.subarray(4, 4 + n)); buf = buf.slice(4 + n);
+      }
+    }
+  } catch (e) {}
+}
+setInterval(() => { if (performance.now() - lastFrame > 2500) { nofeed.hidden = false; startVideo(); } }, 1000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) startVideo(); });
+startVideo();
+
+// Fixed sticks: a touch must start inside the circle; it is then followed anywhere until let go
+function bind(s) {
+  const el = s.el;
+  el.addEventListener('pointerdown', e => {
+    if (s.id !== null) return;
+    const r = el.getBoundingClientRect();
+    s.id = e.pointerId; s.cx = r.left + r.width / 2; s.cy = r.top + r.height / 2; s.R = r.width / 2 - 10;
+    el.setPointerCapture(e.pointerId); el.classList.add('held'); move(s, e);
+  });
+  el.addEventListener('pointermove', e => { if (e.pointerId === s.id) move(s, e); });
+  const end = e => { if (e.pointerId !== s.id) return; s.id = null; s.x = s.y = 0; el.classList.remove('held'); el.firstChild.style.transform = ''; send(); };
+  el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
+}
+function move(s, e) {
+  let dx = e.clientX - s.cx, dy = e.clientY - s.cy, m = Math.hypot(dx, dy);
+  if (m > s.R) { dx *= s.R / m; dy *= s.R / m; }
+  s.el.firstChild.style.transform = `translate(${dx}px,${dy}px)`;
+  s.x = dx / s.R; s.y = -dy / s.R;
+  if (Math.abs(s.x) < 0.1) s.x = 0; if (Math.abs(s.y) < 0.1) s.y = 0;
+}
+bind(sticks.l); bind(sticks.r);
+
+function post(url, body) {
+  return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+}
+function send() {
+  const l = sticks.l, r = sticks.r;
+  post('/cmd', { lx: l.x, ly: l.y, rx: r.x }).catch(() => {});
+}
+// Resend while a stick is held (server stops after 0.3 s of silence), then a few zeros after release
+setInterval(() => {
+  if (sticks.l.id !== null || sticks.r.id !== null) { sending = 3; send(); }
+  else if (sending > 0) { sending--; send(); }
+}, 50);
+
+// Hold a button 0.5 s to see what it does; that press then does nothing. Phones show no title tooltips.
+document.addEventListener('contextmenu', e => e.preventDefault());
+let tipT = null, tipShown = false;
+document.addEventListener('pointerdown', e => {
+  const b = e.target.closest('button[title]'); if (!b) return;
+  tipShown = false; clearTimeout(tipT);
+  tipT = setTimeout(() => {
+    const r = b.getBoundingClientRect(), tip = $('tip');
+    tip.textContent = b.title; tip.hidden = false; tipShown = true;
+    tip.style.top = (r.bottom + 30 > innerHeight ? r.top - tip.offsetHeight - 6 : r.bottom + 6) + 'px';
+    tip.style.left = Math.max(8, Math.min(innerWidth - tip.offsetWidth - 8, r.left + r.width / 2 - tip.offsetWidth / 2)) + 'px';
+  }, 500);
+});
+const tipEnd = () => { clearTimeout(tipT); setTimeout(() => $('tip').hidden = true, 1200); };
+document.addEventListener('pointerup', tipEnd); document.addEventListener('pointercancel', tipEnd);
+document.addEventListener('click', e => { if (tipShown && e.target.closest('button[title]')) { e.stopPropagation(); e.preventDefault(); tipShown = false; } }, true);
+// Are you sure? popup in the middle of the screen; only its red button fires
+let askFire = null;
+function ask(q, p, yes, fire) {
+  $('askq').textContent = q; $('askp').textContent = p; $('askyes').textContent = yes; askFire = fire; $('ask').hidden = false;
+}
+$('askno').onclick = () => { $('ask').hidden = true; };
+$('askyes').onclick = () => { $('ask').hidden = true; askFire && askFire(); };
+power.onclick = () => ask('SHUT DOWN THE PI?', 'Turn the power off once the Pi\'s light goes red (about 10 s).', 'SHUT DOWN',
+  () => { post('/shutdown'); power.innerHTML += 'SHUTTING DOWN'; });
+$('clr').onclick = () => ask('CLEAR ALL PINS?', 'Removes every person pin and resets the heading to 0.', 'CLEAR',
+  () => post('/map/clear'));
+let st = null, base = 'ir';                      // last /status; camera under the heat (IR or colour)
+$('view').onclick = () => st && post('/opts', { view: st.view === 'thermal' ? base : st.view === 'ir' ? 'rgb' : 'ir' });
+// Heat: over the camera -> heat only -> off -> over the camera
+$('heat').onclick = () => st && post('/opts', st.view === 'thermal' ? { view: base, overlay: false }
+  : st.overlay ? { view: 'thermal' } : { overlay: true });
+$('halt').onclick = () => st && post('/opts', { autohalt: !st.autohalt });
+$('ir').onclick = () => st && post('/opts', { ir: !st.ir });
+$('avoid').onclick = () => st && post('/opts', { avoid: !st.avoid });
+$('rgb').onclick = () => st && post('/opts', { rgb: { status: 'white', white: 'off', off: 'status' }[st.rgb] });
+const snapIcon = $('snap').innerHTML;
+$('snap').onclick = async () => {
+  let r = {}; try { r = await (await post('/snap')).json(); } catch (e) {}
+  $('snap').innerHTML = snapIcon + (r.name ? 'SAVED' : 'NO FEED'); setTimeout(() => $('snap').innerHTML = snapIcon, 1200);
+};
+// Fullscreen: the first touch anywhere goes fullscreen and holds landscape; the button only shows outside it,
+// and the phone's back gesture leaves it. iPhone Safari has no page fullscreen: Share > Add to Home Screen instead.
+function goFull() {
+  const el = document.documentElement, req = el.requestFullscreen || el.webkitRequestFullscreen;
+  if (document.fullscreenElement || document.webkitFullscreenElement || !req) return;
+  Promise.resolve(req.call(el)).then(() => screen.orientation?.lock?.('landscape')).catch(() => {});
+}
+document.addEventListener('pointerdown', goFull, { once: true, capture: true });
+const fsChange = () => document.body.classList.toggle('fs', !!(document.fullscreenElement || document.webkitFullscreenElement));
+document.addEventListener('fullscreenchange', fsChange); document.addEventListener('webkitfullscreenchange', fsChange);
+full.onclick = goFull;
+
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function canvas(el) {
+  const dpr = devicePixelRatio || 1, W = el.clientWidth, c = el.getContext('2d');
+  if (el.width !== W * dpr) { el.width = el.height = W * dpr; }
+  c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, W, W);
+  return [c, W];
+}
+
+// Person pins (odometry positions) for the compass
+let mapData = { path: [], pins: [] };
+async function pollMap() {
+  try { mapData = await (await fetch('/map', { cache: 'no-store' })).json(); } catch (e) {}
+  setTimeout(pollMap, 1000);
+}
+pollMap();
+
+// Compass dial, game style: ahead is up, N = start direction. A dark ring round a lighter grey centre; on the ring
+// N E S W turned with the dial, short white ticks between them, and each person as a numbered map pin at their
+// bearing (the same pin and number the video shows over them).
+function drawComp(x, y, th, hdg) {
+  const [c, W] = canvas($('comp')), m = W / 2, R = (m - 2) / 1.14, band = R * 0.3, rr = R - band / 2;   // rr: middle of the ring
+  const rad = d => (d - 90) * Math.PI / 180;                       // compass deg (0 up, clockwise) -> canvas angle
+  const at = (deg, d) => [m + d * Math.cos(rad(deg)), m + d * Math.sin(rad(deg))];
+  c.fillStyle = 'rgba(0,0,0,.55)'; c.beginPath(); c.arc(m, m, R, 0, 7); c.fill();                    // ring
+  c.fillStyle = 'rgba(70,74,80,.55)'; c.beginPath(); c.arc(m, m, R - band, 0, 7); c.fill();          // centre
+  c.strokeStyle = 'rgba(242,244,247,.8)'; c.lineWidth = 1.5; c.lineCap = 'round';
+  for (let a = 45; a < 360; a += 90) {                              // ticks: short dashes across the ring
+    const [u1, v1] = at(a - hdg, rr - 3), [u2, v2] = at(a - hdg, rr + 3);
+    c.beginPath(); c.moveTo(u1, v1); c.lineTo(u2, v2); c.stroke();
+  }
+  c.fillStyle = css('--fg'); c.font = `600 ${Math.round(band * 0.85)}px "Barlow Condensed",sans-serif`; c.textAlign = 'center'; c.textBaseline = 'middle';
+  ['N', 'E', 'S', 'W'].forEach((l, i) => {                          // letters on the ring, tops facing out
+    const a = i * 90 - hdg, [u, v] = at(a, rr);
+    c.save(); c.translate(u, v); c.rotate(a * Math.PI / 180); c.fillText(l, 0, 0.5); c.restore();
+  });
+  c.font = `700 ${Math.round(band * 0.7)}px "Barlow Condensed",sans-serif`;
+  for (const p of mapData.pins) {                                   // + rel = to the left, so it sits anticlockwise
+    const rel = (Math.atan2(p.y - y, p.x - x) - th) * 180 / Math.PI, [u, v] = at(-rel, rr), s = band * 0.5, h = v - s * 0.9;
+    const a = Math.acos(1 / 2.2);                                   // teardrop: tangents from a tip 2.2 radii below
+    c.fillStyle = css('--pin'); c.strokeStyle = 'rgba(0,0,0,.6)'; c.lineWidth = 1;
+    c.beginPath(); c.arc(u, h, s, Math.PI / 2 + a, Math.PI * 2.5 - a); c.lineTo(u, h + s * 2.2); c.closePath(); c.fill(); c.stroke();
+    c.fillStyle = '#000'; c.fillText(p.n || '', u, h + 0.5);
+  }
+}
+
+let contacts = null, contactT = 0;
+async function poll() {
+  try {
+    const t0 = performance.now();
+    const s = st = await (await fetch('/status', { cache: 'no-store' })).json();
+    const ping = performance.now() - t0;
+    // Speed, or what is wrong with the motor board: FAULT a motor failed to start, NOVIN no motor power
+    const bad = !s.ok ? (s.state === 'NOVIN' ? 'NO MOTOR V' : s.state === 'FAULT' ? 'MOTOR FAULT' : 'NO BOARD') : '';
+    spd.textContent = bad || (((s.velL + s.velR) / 2) * WHEEL_R).toFixed(2) + ' M/S'; spd.className = bad ? 'bad' : '';
+    if (s.hub) { tilt.textContent = s.hub[0].toFixed(0) + '°'; tilt.className = Math.abs(s.hub[0]) > 30 ? 'warn' : ''; }
+    $('spin').hidden = !s.spinning;
+    const near = s.people.filter(p => p.dist).map(p => p.dist);
+    $('pers').textContent = s.people.length + (near.length ? '  ' + Math.min(...near).toFixed(1) + ' M' : '');
+    $('them').classList.toggle('hot', s.people.length > 0);
+    if (s.vin && s.batt != null) {
+      $('battnum').firstChild.textContent = s.batt.toFixed(0);
+      $('battbar').firstChild.style.width = Math.max(0, Math.min(100, s.batt)) + '%';
+      $('battbar').firstChild.style.background = css(s.batt < 10 ? '--bad' : s.batt < 25 ? '--orange' : '--fg');
+      $('battv').textContent = s.vin.toFixed(1) + ' V' + (s.batt_mins ? '  ~' + s.batt_mins.toFixed(0) + ' MIN' : '');
+    }
+    $('temp').textContent = 'BOARD ' + (s.board_temp == null ? '--' : s.board_temp.toFixed(0) + '°') + '  PI ' + s.pi_temp.toFixed(0) + '°'
+      + (s.fan && s.fan[0] != null ? '  FAN ' + (s.fan[1] ? 'STOPPED' : s.fan[0]) : '');
+    $('temp').className = s.pi_temp > 75 || s.board_temp > 60 || (s.fan && s.fan[1]) ? 'bad' : s.pi_temp > 65 || s.board_temp > 50 ? 'warn' : '';
+    $('ahead').textContent = s.obstacle == null ? '--' : s.obstacle.toFixed(2) + ' M';
+    $('ahead').className = s.obstacle != null && s.obstacle < s.stop_dist ? 'bad' : '';
+    const hdg = ((-s.th * 180 / Math.PI) % 360 + 360) % 360;   // compass style: right turn = clockwise, 0 = start direction
+    $('hdg').textContent = hdg.toFixed(0) + '°';
+    $('ai').textContent = s.ai_fps.toFixed(0) + ' FPS';
+    $('ping').textContent = ping.toFixed(0) + ' MS'; $('ping').className = ping > 300 ? 'bad' : ping > 120 ? 'warn' : '';
+    $('halt').classList.toggle('on', s.autohalt);
+    $('ir').classList.toggle('on', s.ir);
+    $('avoid').classList.toggle('on', s.avoid);
+    $('rgb').classList.toggle('on', s.rgb !== 'off');
+    $('rgbm').textContent = { status: 'AUTO', white: 'WHITE', off: 'OFF' }[s.rgb];
+    if (contacts !== null && s.contacts > contacts) { contactT = Date.now(); navigator.vibrate?.([200, 100, 200]); }
+    contacts = s.contacts;
+    if (s.view !== 'thermal') base = s.view;
+    $('vname').textContent = s.view === 'thermal' ? 'HEAT' : s.view.toUpperCase() + (s.overlay ? '+HEAT' : '');
+    $('heat').classList.toggle('on', s.view === 'thermal' || s.overlay);
+    drawComp(s.x, s.y, s.th, hdg);
+    const find = Date.now() - contactT < 2500, fanStop = s.fan && s.fan[1];
+    const alert = s.halted ? 'PERSON: HALTED · LET GO OF STICKS' : s.blocked ? 'OBSTACLE AHEAD'
+      : find ? 'PERSON DETECTED'
+      : fanStop ? 'FAN STOPPED: CHECK FOR A CAUGHT WIRE'
+      : s.vin && s.batt != null && s.batt < 10 ? 'BATTERY LOW: HEAD BACK' : s.pi_temp > 80 ? 'PI OVERHEATING' : '';
+    $('alert').textContent = alert; $('alert').hidden = !alert;
+    $('alert').classList.toggle('find', alert === 'PERSON DETECTED');
+  } catch (e) { spd.textContent = 'NO PI'; spd.className = 'bad'; }
+  setTimeout(poll, 400);
+}
+poll();
+</script>
+</body>
+</html>

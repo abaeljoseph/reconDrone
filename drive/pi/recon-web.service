@@ -1,0 +1,15 @@
+[Unit]
+Description=Recon drone phone remote (web.py)
+After=network.target
+
+[Service]
+User=abael
+WorkingDirectory=/home/abael
+ExecStart=/usr/bin/python3 web.py /dev/ttyAMA0 8080
+StandardOutput=append:/home/abael/web.log
+StandardError=append:/home/abael/web.log
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

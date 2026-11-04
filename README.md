@@ -180,10 +180,15 @@ The map and stop on detect are built, but were not tested with a person on the f
 | Path | What it is |
 |---|---|
 | [`realsense_yolo.py`](realsense_yolo.py) | Early detection app on the D435 |
-| [`ncnn_pose.py`](ncnn_pose.py) | YOLOv8n pose on NCNN |
+| [`ncnn_pose.py`](ncnn_pose.py) | YOLOv8n pose on NCNN, used by `web.py` |
 | [`realsense_distance.py`](realsense_distance.py) | Depth distance readout |
 | [`power_monitor.py`](power_monitor.py), [`usb_check.py`](usb_check.py) | Pi power and USB helpers |
-| [`drive/`](drive/) | Motor firmware, motor tests, Pi drive script and flash tools |
+| [`drive/pi/`](drive/pi/) | The code that runs on the drone: `web.py` (detection and server), `web.html` (phone app), `thermal.py`, `drive.py`, `leds.py`, `report_tests.py` (the test script) |
+| [`drive/drive_fw/`](drive/drive_fw/) | ESP32 motor firmware |
+| [`drive/tools/`](drive/tools/) | Flash and bench test tools |
+| `drive/encoder_test/`, `drive/m1_diag/`, `drive/motor_test/` | Motor bring up sketches |
 | `yolov8*_ncnn_model/` | Exported NCNN models |
 | [`Recon Drone Progress Photos/`](Recon%20Drone%20Progress%20Photos/) | Screenshots from early development |
 | [`docs/`](docs/) | Success tiers, plus the images and GIFs used here |
+
+MegaDetector was trialled and dropped from the phone app, so its models are not included. `report_tests.py` needs them for those tests only.

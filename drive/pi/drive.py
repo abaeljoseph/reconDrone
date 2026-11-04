@@ -3,8 +3,8 @@ import math, os, serial, threading, time
 #   d = Drive('/dev/ttyUSB0'); d.wheels(4, 4)  or  d.twist(0.2, 0)  ...  d.pose() -> (x m, y m, heading rad)
 #   d.close()   (also runs on exit; the board watchdog stops the motors 300 ms after this process dies)
 # CLI test: drive.py PORT [SECONDS LEFT RIGHT]   prints pose; with no speeds just tracks (turn wheels by hand)
-WHEEL_D = 0.100    # m, wheel outer diameter (brief says 108.6, user said assume 100 for now)
-TRACK   = 0.200    # m, centre of left wheel to centre of right wheel. PLACEHOLDER until measured
+WHEEL_D = 0.1178   # m, effective: 715 mm driven per 12.14 rad on wood (2026-10-30); CAD 124 mm over the tread peaks
+TRACK   = 0.231    # m, centre of left tread to centre of right (CAD), checked by a 363 deg spin on wood (2026-10-30)
 MAX_VEL = 15.0     # rad/s, same clamp as drive_fw
 SEND_HZ = 20
 
@@ -23,6 +23,8 @@ class Drive:
         self.prev = None                    # (ms, angL, angR) of last T line
         self.state, self.velL, self.velR, self.last_t = '?', 0.0, 0.0, 0.0
         self.imu, self.diag = None, None    # (ax ay az g, gx gy gz deg/s), (loopHz, imuErr, rejL, rejR)
+        self.hub = None                     # (tilt from rest deg, rate deg/s, drive scale 0..1)
+        self.vin, self.temp = None, None    # motor supply V, board IMU temperature C
         self.log = log or (lambda line: None)
         self.alive = True
         self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
@@ -83,6 +85,16 @@ class Drive:
             try: v = [float(x) for x in p[2:]]
             except ValueError: self.log(line); return
             with self.lock: self.imu, self.diag = tuple(v[:6]), tuple(int(x) for x in v[6:])
+            return
+        if len(p) in (5, 6) and p[0] == 'H':   # tilt, rate, scale[, damp]
+            try: v = tuple(float(x) for x in p[2:])
+            except ValueError: self.log(line); return
+            with self.lock: self.hub = v
+            return
+        if len(p) == 4 and p[0] == 'P':
+            try: v, t = float(p[2]), float(p[3])
+            except ValueError: self.log(line); return
+            with self.lock: self.vin, self.temp = v, (None if math.isnan(t) else t)
             return
         if len(p) != 7 or p[0] != 'T': self.log(line); return
         try: ms, aL, aR, vL, vR = int(p[1]), float(p[2]), float(p[3]), float(p[4]), float(p[5])
